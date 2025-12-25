@@ -133,12 +133,21 @@ async fn start(
 			Duration::from_millis(10),
 		))
 		.await;
+
+	let mut systemd_env_vars = Vec::new();
+
+	#[cfg(feature = "systemd")]
+	if *is_systemd_used() {
+	   systemd_env_vars = get_systemd_env_and_blacklist().await;
+	}
+
 	let token = CancellationToken::new();
 	let (env_tx, env_rx) = oneshot::channel();
 	let compositor_handle = comp::run_compositor(
 		&process_manager,
 		executable.clone(),
 		args,
+		prepare_env_vars_for_comp(&systemd_env_vars),
 		token.child_token(),
 		env_tx,
 		session_tx,
@@ -150,6 +159,7 @@ async fn start(
 		.expect("failed to receive environmental variables")
 		.into_iter()
 		.collect::<Vec<_>>();
+
 	info!(
 		"got environmental variables from cosmic-comp: {:?}",
 		env_vars
@@ -157,36 +167,11 @@ async fn start(
 
 	// now that cosmic-comp is ready, set XDG_SESSION_TYPE=wayland for new processes
 	env_vars.push(("XDG_SESSION_TYPE".to_string(), "wayland".to_string()));
+	env_vars.extend(systemd_env_vars.into_iter());
 	systemd::set_systemd_environment("XDG_SESSION_TYPE", "wayland").await;
 
 	#[cfg(feature = "systemd")]
 	let _inhibit_fd = if *is_systemd_used() {
-		match get_systemd_env().await {
-			Ok(env) => {
-				for systemd_env in env {
-					// Only update the envvar if unset
-					if std::env::var_os(&systemd_env.key) == None {
-						// Blacklist of envvars that we shouldn't touch (taken from KDE)
-						if (!systemd_env.key.starts_with("XDG_")
-							|| systemd_env.key == "XDG_DATA_DIRS"
-							|| systemd_env.key == "XDG_CONFIG_DIRS")
-							&& systemd_env.key != "DISPLAY"
-							&& systemd_env.key != "XAUTHORITY"
-							&& systemd_env.key != "WAYLAND_DISPLAY"
-							&& systemd_env.key != "WAYLAND_SOCKET"
-							&& systemd_env.key != "_"
-							&& systemd_env.key != "SHELL"
-							&& systemd_env.key != "SHLVL"
-						{
-							env_vars.push((systemd_env.key, systemd_env.value));
-						}
-					}
-				}
-			}
-			Err(err) => {
-				warn!("Failed to sync systemd environment {}.", err);
-			}
-		};
 		#[cfg(feature = "logind")]
 		match zbus::Connection::system().await {
 			Ok(connection) => match logind_zbus::manager::ManagerProxy::new(&connection).await {
@@ -558,4 +543,59 @@ async fn start_component(
 		let _enter = stderr_span_clone.enter();
 		error!("failed to start {}: {}", cmd, err);
 	}
+}
+
+/// Retrieves the systemd environment variables that were set in the user's scope
+/// (usually `~/.config/environment.d/*.conf`) and removes variables that are
+/// unwanted when propagating.
+async fn get_systemd_env_and_blacklist() -> Vec<(String, String)> {
+    let systemd_vars = match get_systemd_env().await {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("Failed to sync systemd environment {}.", err);
+            return Vec::new();
+        }
+    };
+
+    systemd_vars
+        .into_iter()
+        .filter(|v| {
+            // Only update the envvar if unset
+            env::var_os(&v.key).is_none() &&
+
+            // Blacklist of envvars that we shouldn't touch (taken from KDE)
+            (!v.key.starts_with("XDG_")
+				|| v.key == "XDG_DATA_DIRS"
+				|| v.key == "XDG_CONFIG_DIRS")
+				&& v.key != "DISPLAY"
+				&& v.key != "XAUTHORITY"
+				&& v.key != "WAYLAND_DISPLAY"
+				&& v.key != "WAYLAND_SOCKET"
+				&& v.key != "_"
+				&& v.key != "SHELL"
+				&& v.key != "SHLVL"
+        })
+        .map(|v| (v.key, v.value))
+        .collect()
+}
+
+fn prepare_env_vars_for_comp(env_vars: &[(String, String)]) -> Vec<(String, String)> {
+    env_vars.iter()
+        .filter(|(key, _)|
+            // Blacklist opf envvars that may interfere with the compositor
+            key != "HOME"
+                && key != "LIBEXEC_PATH"
+                && key != "LOCALE_ARCHIVE"
+                && key != "NIX_XDG_DESKTOP_PORTAL_DIR"
+                && key != "PATH"
+                && key != "SHELL"
+                && key != "QTWEBKIT_PLUGIN_PATH"
+                && key != "TERMINFO_DIRS"
+                && key != "TZDIR"
+                && key != "USER"
+                && key != "DISPLAY"
+                && key != "WAYLAND_DISPLAY"
+        )
+        .cloned()
+        .collect()
 }
